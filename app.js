@@ -2,16 +2,47 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const NOTIFY = '00002b10-0000-1000-8000-00805f9b34fb';
-const WRITE = '00002b11-0000-1000-8000-00805f9b34fb';
+const VERSION = 3;
+
+const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
+const NOTIFY = uuid16(0x2b10);
+const WRITE = uuid16(0x2b11);
 // The lamp advertises 0xA201; its data service is one of these, depending on the firmware.
-const ADVERTISED = 0xa201;
-const SERVICES = [0x1910, 0xfd50, ADVERTISED];
+const ADVERTISED = uuid16(0xa201);
+const SERVICES = [uuid16(0x1910), uuid16(0xfd50), ADVERTISED];
 
 const DEFAULT_DPS = { switch: 20, bright: 22, temp: 23, countdown: 26, brightMin: 10, brightMax: 1000, tempMax: 1000 };
 const RESPONSE_MS = 5000;
 const REPORT_MS = 800;
 const IDLE_MS = 5000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// --- diagnostics: what the page is doing, shown under "Диагностика" -------------------------
+
+const started = performance.now();
+const lines = [];
+let step = '';
+
+/** Notes a step of the current command; an error is reported together with the step it hit. */
+function trace(text) {
+  step = text;
+  lines.push(`${((performance.now() - started) / 1000).toFixed(1)} с  ${text}`);
+  if (lines.length > 40) lines.shift();
+  const log = document.getElementById('log');
+  if (log) log.textContent = lines.join('\n');
+}
+
+/** Browsers disagree on what a Bluetooth failure looks like: an Error, a DOMException or plain text. */
+function describe(e) {
+  if (e instanceof Error) return e.message || e.name;
+  if (typeof e === 'string') return e;
+  try {
+    return JSON.stringify(e) ?? String(e);
+  } catch {
+    return String(e);
+  }
+}
 
 // --- configuration: the lamp's key, kept in this browser only ----------------------------
 
@@ -46,44 +77,46 @@ class Link {
   async open(device) {
     this.device = device;
     this.codec.reset();
-    device.addEventListener('gattserverdisconnected', () => this.dropped(), { once: true });
-    mark('connect');
+    device.addEventListener('gattserverdisconnected', () => this.dropped());
+    trace('подключение к лампе');
     const server = await device.gatt.connect();
-    mark('connected');
     let notify, write;
     // The service that worked last time goes first: every miss costs time.
-    const last = Number(localStorage.getItem('lamp-service'));
+    const last = localStorage.getItem('lamp-service');
     for (const uuid of [...SERVICES].sort((a, b) => (b === last) - (a === last))) {
       try {
+        trace(`поиск службы ${uuid.slice(4, 8)}`);
         const service = await server.getPrimaryService(uuid);
         notify = await service.getCharacteristic(NOTIFY);
         write = await service.getCharacteristic(WRITE);
         localStorage.setItem('lamp-service', uuid);
         break;
-      } catch {
+      } catch (e) {
         // Not this service: try the next one.
+        trace(`службы ${uuid.slice(4, 8)} нет: ${describe(e)}`);
+        notify = write = undefined;
       }
     }
     if (!notify || !write) throw new TuyaError('это не лампа Tuya: нет нужной службы');
+    trace('включение ответов лампы');
     notify.addEventListener('characteristicvaluechanged', (e) => {
       const v = e.target.value;
       this.received(new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice());
     });
     await notify.startNotifications();
     this.write = write;
-    mark('services');
 
+    trace('вход по ключу');
     let info;
     try {
       info = await this.request(Code.DEVICE_INFO, new Uint8Array(0));
     } catch (e) {
-      throw new TuyaError('лампа не ответила на ключ — возможно, её заново привязали в Smart Life');
+      throw new TuyaError(`лампа не ответила на ключ (${describe(e)})`);
     }
     if (!this.codec.onDeviceInfo(info.data)) throw new TuyaError('лампа не привязана: добавьте её в Smart Life');
     const paired = await this.request(Code.PAIR, this.codec.pairingRequest());
     if (paired.data[0] !== 0 && paired.data[0] !== 2) throw new TuyaError(`лампа отклонила ключ (код ${paired.data[0]})`);
     this.ready = true;
-    mark('login');
   }
 
   /** Asks for the given data points and waits for the lamp's report. */
@@ -135,7 +168,7 @@ class Link {
         clearTimeout(timer);
         fn(value);
       };
-      // The sequence number is known only after build(); register under it before any answer can come.
+      // send() takes this number for the message before its first pause; register under it first.
       const seq = this.codec.seq;
       this.pending.set(seq, { resolve: done(resolve), reject: done(reject) });
       this.send(code, data).catch((e) => {
@@ -150,6 +183,7 @@ class Link {
     try {
       message = this.codec.feed(chunk);
     } catch (e) {
+      trace(`непонятный ответ: ${describe(e)}`);
       this.dropped();
       return;
     }
@@ -157,7 +191,7 @@ class Link {
     try {
       this.handle(message);
     } catch (e) {
-      console.warn('message ignored', message.code.toString(16), e);
+      trace(`сообщение ${message.code.toString(16)} пропущено: ${describe(e)}`);
     }
     if (message.responseTo) {
       this.pending.get(message.responseTo)?.resolve(message);
@@ -205,11 +239,6 @@ class Link {
   }
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Timeline of the last command, for the browser's performance tools. */
-const mark = (name) => performance.mark(`lamp-${name}`);
-
 // --- the lamp ----------------------------------------------------------------------------
 
 const config = loadConfig();
@@ -253,13 +282,19 @@ class NeedsTap extends Error {}
 /** A lamp this browser was already allowed to use: no chooser needed, where the browser supports it. */
 async function rememberedDevice() {
   if (!navigator.bluetooth.getDevices) return null;
-  const known = await navigator.bluetooth.getDevices();
-  const id = localStorage.getItem('lamp-device');
-  return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
+  try {
+    const known = await navigator.bluetooth.getDevices();
+    const id = localStorage.getItem('lamp-device');
+    return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
+  } catch (e) {
+    trace(`список известных устройств недоступен: ${describe(e)}`);
+    return null;
+  }
 }
 
 async function chooseDevice(allowChooser) {
   if (!allowChooser) throw new NeedsTap();
+  trace('выбор лампы в списке');
   let chosen;
   try {
     chosen = await navigator.bluetooth.requestDevice({
@@ -267,9 +302,9 @@ async function chooseDevice(allowChooser) {
       optionalServices: SERVICES,
     });
   } catch (e) {
-    // The tap has "expired" while an earlier attempt was running: one more tap is needed.
-    if (e.name === 'SecurityError') throw new NeedsTap();
-    if (e.name === 'NotFoundError') throw new TuyaError('лампа не выбрана');
+    // Chrome: the tap has "expired" or there was none. One more tap is needed.
+    if (e?.name === 'SecurityError') throw new NeedsTap();
+    if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e))) throw new TuyaError('лампа не выбрана');
     throw e;
   }
   localStorage.setItem('lamp-device', chosen.id);
@@ -298,6 +333,7 @@ async function connected(allowChooser) {
     } catch (e) {
       // The key is wrong or the lamp refused: another device would not help.
       if (e instanceof TuyaError) throw e;
+      trace(`знакомая лампа не подключилась: ${describe(e)}`);
       device = null;
     }
   }
@@ -306,17 +342,17 @@ async function connected(allowChooser) {
 
 let busy = Promise.resolve();
 
-/** Runs one button. [fromTap] tells whether the browser will allow its device chooser. */
-function run(name, fromTap) {
+/** Runs one button. [mayChoose] tells whether to try the browser's device chooser. */
+function run(name, mayChoose) {
   busy = busy.then(async () => {
     clearTimeout(idleTimer);
-    performance.clearMarks();
-    mark('tap');
     const d = config.dps;
+    trace(`— ${name} —`);
     setStatus('связываюсь с лампой…');
     try {
-      const l = await connected(fromTap);
+      const l = await connected(mayChoose);
       // Ask the lamp where it stands: its remote or another phone may have changed it.
+      trace('чтение состояния');
       await l.refresh([d.switch, d.bright, d.temp]);
       const read = () => ({
         on: l.dps.has(d.switch) ? Dp.int(l.dps.get(d.switch)) !== 0 : state.on,
@@ -325,17 +361,24 @@ function run(name, fromTap) {
       });
       state = read();
       const dps = ACTIONS[name](state, d);
-      mark('state');
-      if (dps.length) await l.set(dps);
-      mark('done');
+      if (dps.length) {
+        trace('команда');
+        await l.set(dps);
+      }
       state = read();
       localStorage.setItem('lamp-state', JSON.stringify(state));
+      trace('готово');
       setStatus('');
       hidePrompt();
     } catch (e) {
-      if (!(e instanceof NeedsTap)) setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth: ${e.message}`, true);
-      else if (name === 'refresh') setStatus('');
-      else showPrompt(name);
+      if (e instanceof NeedsTap) {
+        if (name === 'refresh') setStatus('');
+        else showPrompt(name);
+      } else {
+        const where = step;
+        trace(`ошибка: ${describe(e)}`);
+        setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth (${where}): ${describe(e)}`, true);
+      }
     }
     render();
     // Let go of the lamp soon: it talks to one phone at a time.
@@ -381,6 +424,7 @@ function hidePrompt() {
 }
 
 function start() {
+  trace(`версия ${VERSION}, Bluetooth ${navigator.bluetooth ? 'есть' : 'нет'}, список известных устройств ${navigator.bluetooth?.getDevices ? 'есть' : 'нет'}`);
   if (!navigator.bluetooth) {
     setStatus('Этот браузер не умеет Bluetooth. На iPhone откройте страницу в Bluefy, на Android — в Chrome.', true);
     return;
@@ -393,9 +437,11 @@ function start() {
     button.addEventListener('click', () => run(button.dataset.do, true));
   }
   render();
-  // A shortcut may ask for an action straight away: ...?do=dim or ...?do=bright.
+  // A shortcut may ask for an action straight away: ...?do=dim or ...?do=bright. Then the chooser
+  // is tried at once; a browser that insists on a tap first gets the big button instead.
   const wanted = new URLSearchParams(location.search).get('do');
-  run(wanted in ACTIONS ? wanted : 'refresh', false);
+  if (wanted in ACTIONS) run(wanted, true);
+  else run('refresh', false);
 }
 
 start();
