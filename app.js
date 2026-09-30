@@ -1,0 +1,401 @@
+// The lamp remote as a web page, for browsers with Web Bluetooth (Bluefy on iPhone, Chrome on
+// Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
+import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
+
+const NOTIFY = '00002b10-0000-1000-8000-00805f9b34fb';
+const WRITE = '00002b11-0000-1000-8000-00805f9b34fb';
+// The lamp advertises 0xA201; its data service is one of these, depending on the firmware.
+const ADVERTISED = 0xa201;
+const SERVICES = [0x1910, 0xfd50, ADVERTISED];
+
+const DEFAULT_DPS = { switch: 20, bright: 22, temp: 23, countdown: 26, brightMin: 10, brightMax: 1000, tempMax: 1000 };
+const RESPONSE_MS = 5000;
+const REPORT_MS = 800;
+const IDLE_MS = 5000;
+
+// --- configuration: the lamp's key, kept in this browser only ----------------------------
+
+function loadConfig() {
+  // First visit: the key arrives after "#c=" (never sent to the server), then moves to storage.
+  const match = location.hash.match(/c=([A-Za-z0-9_-]+)/);
+  if (match) {
+    const json = atob(match[1].replace(/-/g, '+').replace(/_/g, '/'));
+    localStorage.setItem('lamp-config', json);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  try {
+    const config = JSON.parse(localStorage.getItem('lamp-config'));
+    if (!config?.deviceId || !config.uuid || !config.localKey) return null;
+    return { ...config, dps: { ...DEFAULT_DPS, ...config.dps } };
+  } catch {
+    return null;
+  }
+}
+
+// --- Bluetooth link ----------------------------------------------------------------------
+
+class Link {
+  constructor(config) {
+    this.codec = new TuyaCodec(config.localKey, config.uuid, config.deviceId);
+    this.dps = new Map();
+    this.pending = new Map();
+    this.reports = 0;
+    this.ready = false;
+  }
+
+  async open(device) {
+    this.device = device;
+    this.codec.reset();
+    device.addEventListener('gattserverdisconnected', () => this.dropped(), { once: true });
+    mark('connect');
+    const server = await device.gatt.connect();
+    mark('connected');
+    let notify, write;
+    // The service that worked last time goes first: every miss costs time.
+    const last = Number(localStorage.getItem('lamp-service'));
+    for (const uuid of [...SERVICES].sort((a, b) => (b === last) - (a === last))) {
+      try {
+        const service = await server.getPrimaryService(uuid);
+        notify = await service.getCharacteristic(NOTIFY);
+        write = await service.getCharacteristic(WRITE);
+        localStorage.setItem('lamp-service', uuid);
+        break;
+      } catch {
+        // Not this service: try the next one.
+      }
+    }
+    if (!notify || !write) throw new TuyaError('это не лампа Tuya: нет нужной службы');
+    notify.addEventListener('characteristicvaluechanged', (e) => {
+      const v = e.target.value;
+      this.received(new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice());
+    });
+    await notify.startNotifications();
+    this.write = write;
+    mark('services');
+
+    let info;
+    try {
+      info = await this.request(Code.DEVICE_INFO, new Uint8Array(0));
+    } catch (e) {
+      throw new TuyaError('лампа не ответила на ключ — возможно, её заново привязали в Smart Life');
+    }
+    if (!this.codec.onDeviceInfo(info.data)) throw new TuyaError('лампа не привязана: добавьте её в Smart Life');
+    const paired = await this.request(Code.PAIR, this.codec.pairingRequest());
+    if (paired.data[0] !== 0 && paired.data[0] !== 2) throw new TuyaError(`лампа отклонила ключ (код ${paired.data[0]})`);
+    this.ready = true;
+    mark('login');
+  }
+
+  /** Asks for the given data points and waits for the lamp's report. */
+  async refresh(ids) {
+    const before = this.reports;
+    await this.request(Code.DEVICE_STATUS, Uint8Array.from(ids));
+    const deadline = Date.now() + REPORT_MS;
+    while (this.reports === before && Date.now() < deadline) await sleep(10);
+  }
+
+  async set(dps) {
+    const answer = await this.request(Code.DPS, Dp.encode(dps));
+    if (answer.data.length && answer.data[0] !== 0) throw new TuyaError(`лампа отклонила команду (код ${answer.data[0]})`);
+    for (const dp of dps) this.dps.set(dp.id, dp);
+  }
+
+  close() {
+    this.ready = false;
+    try {
+      this.device?.gatt.disconnect();
+    } catch {
+      // Already gone.
+    }
+  }
+
+  dropped() {
+    this.ready = false;
+    for (const { reject } of this.pending.values()) reject(new TuyaError('лампа разорвала соединение'));
+    this.pending.clear();
+  }
+
+  async send(code, data, responseTo = 0) {
+    const { seq, chunks } = this.codec.build(code, data, responseTo);
+    // Writes must not interleave: one message at a time.
+    this.queue = (this.queue ?? Promise.resolve()).catch(() => {}).then(async () => {
+      for (const chunk of chunks) {
+        if (this.write.writeValueWithoutResponse) await this.write.writeValueWithoutResponse(chunk);
+        else await this.write.writeValue(chunk);
+      }
+    });
+    await this.queue;
+    return seq;
+  }
+
+  request(code, data) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new TuyaError('лампа не ответила')), RESPONSE_MS);
+      const done = (fn) => (value) => {
+        clearTimeout(timer);
+        fn(value);
+      };
+      // The sequence number is known only after build(); register under it before any answer can come.
+      const seq = this.codec.seq;
+      this.pending.set(seq, { resolve: done(resolve), reject: done(reject) });
+      this.send(code, data).catch((e) => {
+        this.pending.delete(seq);
+        done(reject)(e);
+      });
+    });
+  }
+
+  received(chunk) {
+    let message;
+    try {
+      message = this.codec.feed(chunk);
+    } catch (e) {
+      this.dropped();
+      return;
+    }
+    if (!message) return;
+    try {
+      this.handle(message);
+    } catch (e) {
+      console.warn('message ignored', message.code.toString(16), e);
+    }
+    if (message.responseTo) {
+      this.pending.get(message.responseTo)?.resolve(message);
+      this.pending.delete(message.responseTo);
+    }
+  }
+
+  handle(m) {
+    const afterTimestamp = (start) => start + 1 + (m.data[start] === 0 ? 13 : 4);
+    const signed = () => Uint8Array.of(m.data[0], m.data[1], m.data[2], 0);
+    const reply = (data) => this.send(m.code, data, m.seq).catch(() => {});
+    switch (m.code) {
+      case Code.RECEIVE_DP:
+        this.update(Dp.decode(m.data, 0));
+        reply(new Uint8Array(0));
+        break;
+      case Code.RECEIVE_TIME_DP:
+        this.update(Dp.decode(m.data, afterTimestamp(0)));
+        reply(new Uint8Array(0));
+        break;
+      case Code.RECEIVE_SIGN_DP:
+        this.update(Dp.decode(m.data, 3));
+        reply(signed());
+        break;
+      case Code.RECEIVE_SIGN_TIME_DP:
+        this.update(Dp.decode(m.data, afterTimestamp(3)));
+        reply(signed());
+        break;
+      case Code.TIME1_REQ:
+        reply(this.codec.time1(Date.now(), -new Date().getTimezoneOffset()));
+        break;
+      case Code.TIME2_REQ: {
+        const now = new Date();
+        const zone = Math.trunc((-now.getTimezoneOffset() * 100) / 60);
+        reply(Uint8Array.of(now.getFullYear() % 100, now.getMonth() + 1, now.getDate(), now.getHours(), now.getMinutes(),
+          now.getSeconds(), (now.getDay() + 6) % 7, (zone >> 8) & 0xff, zone & 0xff));
+        break;
+      }
+    }
+  }
+
+  update(dps) {
+    for (const dp of dps) this.dps.set(dp.id, dp);
+    this.reports++;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Timeline of the last command, for the browser's performance tools. */
+const mark = (name) => performance.mark(`lamp-${name}`);
+
+// --- the lamp ----------------------------------------------------------------------------
+
+const config = loadConfig();
+let link = null;
+let device = null;
+let idleTimer = null;
+let state = JSON.parse(localStorage.getItem('lamp-state') ?? 'null') ?? { on: false, bright: 0, temp: 0 };
+
+function mode(s, d) {
+  if (!s.on) return 'off';
+  const slack = (d.brightMax - d.brightMin) / 50;
+  if (s.bright <= d.brightMin + slack) return 'dim';
+  if (s.bright >= d.brightMax - slack) return 'bright';
+  return 'on';
+}
+
+const level = (d, bright) => [Dp.bool(d.switch, true), Dp.value(d.bright, bright)];
+
+/** What each button sends, given the lamp's state. An empty list: nothing to do. */
+const ACTIONS = {
+  // The two widget modes: a second tap on the active one switches the lamp off.
+  dim: (s, d) => (mode(s, d) === 'dim' ? [Dp.bool(d.switch, false)] : level(d, d.brightMin)),
+  bright: (s, d) => (mode(s, d) === 'bright' ? [Dp.bool(d.switch, false)] : level(d, d.brightMax)),
+  // The remote's buttons.
+  power: (s, d) => [Dp.bool(d.switch, !s.on)],
+  night: (s, d) => level(d, d.brightMin),
+  up: (s, d) => (s.on ? [Dp.value(d.bright, Math.min(d.brightMax, s.bright + (d.brightMax - d.brightMin) / 10))] : []),
+  down: (s, d) => (s.on ? [Dp.value(d.bright, Math.max(d.brightMin, s.bright - (d.brightMax - d.brightMin) / 10))] : []),
+  cold: (s, d) => [Dp.value(d.temp, d.tempMax)],
+  warm: (s, d) => [Dp.value(d.temp, 0)],
+  // Warm -> neutral -> cold -> warm, as the remote's button cycles.
+  cct: (s, d) => [Dp.value(d.temp, s.temp < d.tempMax / 4 ? d.tempMax / 2 : s.temp < (d.tempMax * 3) / 4 ? d.tempMax : 0)],
+  timer: (s, d) => (s.on ? [Dp.value(d.countdown, 60)] : []),
+  // Only reads the state.
+  refresh: () => [],
+};
+
+/** The browser shows its device chooser only in answer to a tap. */
+class NeedsTap extends Error {}
+
+/** A lamp this browser was already allowed to use: no chooser needed, where the browser supports it. */
+async function rememberedDevice() {
+  if (!navigator.bluetooth.getDevices) return null;
+  const known = await navigator.bluetooth.getDevices();
+  const id = localStorage.getItem('lamp-device');
+  return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
+}
+
+async function chooseDevice(allowChooser) {
+  if (!allowChooser) throw new NeedsTap();
+  let chosen;
+  try {
+    chosen = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [ADVERTISED] }, { namePrefix: 'TY' }],
+      optionalServices: SERVICES,
+    });
+  } catch (e) {
+    // The tap has "expired" while an earlier attempt was running: one more tap is needed.
+    if (e.name === 'SecurityError') throw new NeedsTap();
+    if (e.name === 'NotFoundError') throw new TuyaError('лампа не выбрана');
+    throw e;
+  }
+  localStorage.setItem('lamp-device', chosen.id);
+  return chosen;
+}
+
+async function open(candidate) {
+  const fresh = new Link(config);
+  try {
+    await fresh.open(candidate);
+  } catch (e) {
+    fresh.close();
+    throw e;
+  }
+  device = candidate;
+  link = fresh;
+  return link;
+}
+
+async function connected(allowChooser) {
+  if (link?.ready) return link;
+  const candidate = device ?? (await rememberedDevice());
+  if (candidate) {
+    try {
+      return await open(candidate);
+    } catch (e) {
+      // The key is wrong or the lamp refused: another device would not help.
+      if (e instanceof TuyaError) throw e;
+      device = null;
+    }
+  }
+  return open(await chooseDevice(allowChooser));
+}
+
+let busy = Promise.resolve();
+
+/** Runs one button. [fromTap] tells whether the browser will allow its device chooser. */
+function run(name, fromTap) {
+  busy = busy.then(async () => {
+    clearTimeout(idleTimer);
+    performance.clearMarks();
+    mark('tap');
+    const d = config.dps;
+    setStatus('связываюсь с лампой…');
+    try {
+      const l = await connected(fromTap);
+      // Ask the lamp where it stands: its remote or another phone may have changed it.
+      await l.refresh([d.switch, d.bright, d.temp]);
+      const read = () => ({
+        on: l.dps.has(d.switch) ? Dp.int(l.dps.get(d.switch)) !== 0 : state.on,
+        bright: l.dps.has(d.bright) ? Dp.int(l.dps.get(d.bright)) : state.bright,
+        temp: l.dps.has(d.temp) ? Dp.int(l.dps.get(d.temp)) : state.temp,
+      });
+      state = read();
+      const dps = ACTIONS[name](state, d);
+      mark('state');
+      if (dps.length) await l.set(dps);
+      mark('done');
+      state = read();
+      localStorage.setItem('lamp-state', JSON.stringify(state));
+      setStatus('');
+      hidePrompt();
+    } catch (e) {
+      if (!(e instanceof NeedsTap)) setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth: ${e.message}`, true);
+      else if (name === 'refresh') setStatus('');
+      else showPrompt(name);
+    }
+    render();
+    // Let go of the lamp soon: it talks to one phone at a time.
+    idleTimer = setTimeout(() => {
+      link?.close();
+      link = null;
+    }, IDLE_MS);
+  });
+}
+
+// --- page --------------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+let statusText = '';
+let statusIsError = false;
+
+function setStatus(message, isError = false) {
+  statusText = message;
+  statusIsError = isError;
+  render();
+}
+
+function render() {
+  const d = config?.dps ?? DEFAULT_DPS;
+  const m = mode(state, d);
+  $('dim').classList.toggle('active', m === 'dim');
+  $('bright').classList.toggle('active', m === 'bright');
+  const percent = Math.min(100, Math.max(1, Math.round(((state.bright - d.brightMin) * 100) / (d.brightMax - d.brightMin))));
+  const status = $('status');
+  status.textContent = statusText || (state.on ? `Лампа включена, яркость ${percent} %` : 'Лампа выключена');
+  status.classList.toggle('error', statusIsError);
+}
+
+function showPrompt(name) {
+  $('prompt-action').textContent = document.querySelector(`[data-do="${name}"] span`)?.textContent ?? '';
+  $('prompt').hidden = false;
+  $('prompt').onclick = () => run(name, true);
+  setStatus('');
+}
+
+function hidePrompt() {
+  $('prompt').hidden = true;
+}
+
+function start() {
+  if (!navigator.bluetooth) {
+    setStatus('Этот браузер не умеет Bluetooth. На iPhone откройте страницу в Bluefy, на Android — в Chrome.', true);
+    return;
+  }
+  if (!config) {
+    setStatus('Лампа не настроена: откройте ссылку настройки, которую выдаёт tools/web_link.py.', true);
+    return;
+  }
+  for (const button of document.querySelectorAll('[data-do]')) {
+    button.addEventListener('click', () => run(button.dataset.do, true));
+  }
+  render();
+  // A shortcut may ask for an action straight away: ...?do=dim or ...?do=bright.
+  const wanted = new URLSearchParams(location.search).get('do');
+  run(wanted in ACTIONS ? wanted : 'refresh', false);
+}
+
+start();
