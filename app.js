@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 3;
+const VERSION = 4;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -12,11 +12,32 @@ const ADVERTISED = uuid16(0xa201);
 const SERVICES = [uuid16(0x1910), uuid16(0xfd50), ADVERTISED];
 
 const DEFAULT_DPS = { switch: 20, bright: 22, temp: 23, countdown: 26, brightMin: 10, brightMax: 1000, tempMax: 1000 };
+const CONNECT_MS = 5000;
+const STEP_MS = 5000;
 const RESPONSE_MS = 5000;
 const REPORT_MS = 800;
-const IDLE_MS = 5000;
+const IDLE_MS = 3000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A Bluetooth call that never answers must not freeze the page: browsers set no limit themselves. */
+function within(ms, promise, what) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Stuck(what)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+class Stuck extends Error {}
 
 // --- diagnostics: what the page is doing, shown under "Диагностика" -------------------------
 
@@ -78,17 +99,23 @@ class Link {
     this.device = device;
     this.codec.reset();
     device.addEventListener('gattserverdisconnected', () => this.dropped());
+    // A link left over from an earlier visit of this page would make connect() wait forever.
+    if (device.gatt.connected) {
+      trace('закрываю старое соединение');
+      device.gatt.disconnect();
+      await sleep(300);
+    }
     trace('подключение к лампе');
-    const server = await device.gatt.connect();
+    const server = await within(CONNECT_MS, device.gatt.connect(), 'лампа не подключается');
     let notify, write;
     // The service that worked last time goes first: every miss costs time.
     const last = localStorage.getItem('lamp-service');
     for (const uuid of [...SERVICES].sort((a, b) => (b === last) - (a === last))) {
       try {
         trace(`поиск службы ${uuid.slice(4, 8)}`);
-        const service = await server.getPrimaryService(uuid);
-        notify = await service.getCharacteristic(NOTIFY);
-        write = await service.getCharacteristic(WRITE);
+        const service = await within(STEP_MS, server.getPrimaryService(uuid), 'служба не отвечает');
+        notify = await within(STEP_MS, service.getCharacteristic(NOTIFY), 'служба не отвечает');
+        write = await within(STEP_MS, service.getCharacteristic(WRITE), 'служба не отвечает');
         localStorage.setItem('lamp-service', uuid);
         break;
       } catch (e) {
@@ -103,7 +130,7 @@ class Link {
       const v = e.target.value;
       this.received(new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice());
     });
-    await notify.startNotifications();
+    await within(STEP_MS, notify.startNotifications(), 'лампа не включает ответы');
     this.write = write;
 
     trace('вход по ключу');
@@ -328,16 +355,33 @@ async function connected(allowChooser) {
   if (link?.ready) return link;
   const candidate = device ?? (await rememberedDevice());
   if (candidate) {
-    try {
-      return await open(candidate);
-    } catch (e) {
-      // The key is wrong or the lamp refused: another device would not help.
-      if (e instanceof TuyaError) throw e;
-      trace(`знакомая лампа не подключилась: ${describe(e)}`);
-      device = null;
+    // Twice after a tap: the first failure closes whatever was left of an old link, which often
+    // is the cure. Once when the page merely looks up the state on opening.
+    for (const attempt of allowChooser ? [1, 2] : [1]) {
+      try {
+        return await open(candidate);
+      } catch (e) {
+        // The key is wrong or the lamp refused: another device would not help.
+        if (e instanceof TuyaError) throw e;
+        trace(`знакомая лампа не подключилась (попытка ${attempt}): ${describe(e)}`);
+        await sleep(400);
+      }
     }
+    device = null;
   }
-  return open(await chooseDevice(allowChooser));
+  try {
+    return await open(await chooseDevice(allowChooser));
+  } catch (e) {
+    if (e instanceof Stuck) throw new TuyaError('лампа не подключается: она выключена, далеко или занята другим телефоном');
+    throw e;
+  }
+}
+
+/** Lets go of the lamp at once: it talks to one phone at a time. */
+function release() {
+  clearTimeout(idleTimer);
+  link?.close();
+  link = null;
 }
 
 let busy = Promise.resolve();
@@ -381,11 +425,8 @@ function run(name, mayChoose) {
       }
     }
     render();
-    // Let go of the lamp soon: it talks to one phone at a time.
-    idleTimer = setTimeout(() => {
-      link?.close();
-      link = null;
-    }, IDLE_MS);
+    // Keep the link for a moment, for a second tap; not longer.
+    idleTimer = setTimeout(release, IDLE_MS);
   });
 }
 
@@ -436,6 +477,12 @@ function start() {
   for (const button of document.querySelectorAll('[data-do]')) {
     button.addEventListener('click', () => run(button.dataset.do, true));
   }
+  // A page in the background gets no timers: without this the phone would keep the lamp's only
+  // connection, and the next visit would find it taken.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) release();
+  });
+  window.addEventListener('pagehide', release);
   render();
   // A shortcut may ask for an action straight away: ...?do=dim or ...?do=bright. Then the chooser
   // is tried at once; a browser that insists on a tap first gets the big button instead.
