@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 7;
+const VERSION = 8;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -17,9 +17,11 @@ const STEP_MS = 5000;
 const RESPONSE_MS = 5000;
 const REPORT_MS = 800;
 const IDLE_MS = 3000;
-// Nobody reads the browser's device list and closes it faster than this: a quicker "no" is the
-// browser refusing the request itself.
-const CHOOSER_GLANCE_MS = 1000;
+// A "no" quicker than this comes from the browser itself: neither the lamp nor a person closing
+// the device list answers that fast.
+const REFUSAL_MS = 1000;
+// How long to listen for the lamp announcing itself.
+const HEAR_MS = 3000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -343,12 +345,37 @@ async function rememberedDevice() {
   if (!navigator.bluetooth.getDevices) return null;
   try {
     const known = await navigator.bluetooth.getDevices();
-    note(`известные устройства: ${known.map((d) => `${d.name ?? '?'}${d.gatt?.connected ? ' (на связи)' : ''}`).join(', ') || 'нет'}`);
+    note(`известные устройства: ${known.map((d) => `${d.name ?? '?'}${d.gatt?.connected ? ' (на связи)' : ''}`).join(', ') || 'нет'}`
+      + `, слушать эфир ${known[0]?.watchAdvertisements ? 'можно' : 'нельзя'}`);
     const id = localStorage.getItem('lamp-device');
     return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
   } catch (e) {
     note(`список известных устройств недоступен: ${describe(e)}`);
     return null;
+  }
+}
+
+/**
+ * Waits for the lamp to announce itself. A browser may refuse to connect to a remembered device
+ * it has not heard since it was started, and only the browser's own list or this gets past that.
+ */
+async function heard(candidate) {
+  if (!candidate.watchAdvertisements) return false;
+  trace('жду сигнала лампы');
+  const stop = new AbortController();
+  try {
+    const signal = new Promise((resolve) => {
+      candidate.addEventListener('advertisementreceived', () => resolve(true), { once: true });
+    });
+    await within(STEP_MS, candidate.watchAdvertisements({ signal: stop.signal }), 'браузер не слушает эфир');
+    const onAir = await Promise.race([signal, sleep(HEAR_MS).then(() => false)]);
+    note(onAir ? 'лампа в эфире' : 'лампы в эфире не слышно');
+    return onAir;
+  } catch (e) {
+    note(`слушать эфир не вышло: ${describe(e)} [${kind(e)}]`);
+    return false;
+  } finally {
+    stop.abort();
   }
 }
 
@@ -381,7 +408,7 @@ async function chooseDevice(allowChooser) {
       if (e?.name === 'SecurityError') throw new NeedsTap();
       const took = performance.now() - asked;
       note(`список закрылся через ${Math.round(took)} мс: ${describe(e)} [${kind(e)}]`);
-      if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e)) || took > CHOOSER_GLANCE_MS) {
+      if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e)) || took > REFUSAL_MS) {
         throw new TuyaError(`лампа не выбрана. ${ABSENT}`);
       }
       refusal = e;
@@ -419,15 +446,20 @@ async function connected(allowChooser) {
   const candidate = device ?? (rememberedFailed ? null : await rememberedDevice());
   if (candidate) {
     // Twice after a tap: the first failure closes whatever was left of an old link, which often
-    // is the cure. Once when the page merely looks up the state on opening.
-    for (const attempt of allowChooser ? [1, 2] : [1]) {
+    // is the cure. When the page merely looks up the state on opening, a second try is made only
+    // for a lamp the browser refused at once and then heard on air.
+    for (const attempt of [1, 2]) {
+      const asked = performance.now();
       try {
         return await open(candidate);
       } catch (e) {
         // The key is wrong or the lamp refused: another device would not help.
         if (e instanceof TuyaError) throw e;
         note(`знакомая лампа не подключилась (попытка ${attempt}): ${describe(e)} [${kind(e)}]`);
-        await sleep(400);
+        if (attempt === 2) break;
+        const onAir = performance.now() - asked < REFUSAL_MS && (await heard(candidate));
+        if (!allowChooser && !onAir) break;
+        if (!onAir) await sleep(400);
       }
     }
     device = null;
