@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 8;
+const VERSION = 9;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -16,7 +16,12 @@ const CONNECT_MS = 5000;
 const STEP_MS = 5000;
 const RESPONSE_MS = 5000;
 const REPORT_MS = 800;
-const IDLE_MS = 3000;
+// Bluefy keeps a page's connection alive while the app sits in the background, and does not
+// reliably tell the page that it went there; the lamp then stays taken and every other phone
+// loses it. So in Bluefy the page connects only for a tap and lets go the moment it is done.
+const BLUEFY = /Bluefy/i.test(navigator.userAgent);
+// How long the link is kept after a command, for a second tap.
+const IDLE_MS = BLUEFY ? 0 : 3000;
 // A "no" quicker than this comes from the browser itself: neither the lamp nor a person closing
 // the device list answers that fast.
 const REFUSAL_MS = 1000;
@@ -486,9 +491,12 @@ function release() {
 // What the browser says about the phone's Bluetooth, where it says anything.
 let available = null;
 let busy = Promise.resolve();
+// Taps not finished yet, the running one included.
+let waiting = 0;
 
 /** Runs one button. [mayChoose] tells whether to try the browser's device chooser. */
 function run(name, mayChoose) {
+  waiting++;
   busy = busy.then(async () => {
     clearTimeout(idleTimer);
     const d = config.dps;
@@ -527,8 +535,11 @@ function run(name, mayChoose) {
       }
     }
     render();
-    // Keep the link for a moment, for a second tap; not longer.
-    idleTimer = setTimeout(release, IDLE_MS);
+    waiting--;
+    // Keep the link for a moment, for a second tap; not longer. Where even a moment is too long,
+    // only while more taps are waiting.
+    if (IDLE_MS) idleTimer = setTimeout(release, IDLE_MS);
+    else if (!waiting) release();
   });
 }
 
@@ -605,9 +616,23 @@ function start() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) release();
     // Back on screen: the lamp may have been changed meanwhile.
-    else run('refresh', false);
+    else if (!BLUEFY) run('refresh', false);
   });
   window.addEventListener('pagehide', release);
+  // Bluefy's own way of telling a page that the app went to the background or came back.
+  if (BLUEFY) {
+    try {
+      const native = (window.BLENative ??= {});
+      const theirs = native.notifyAppState;
+      native.notifyAppState = (active) => {
+        note(`Bluefy: приложение ${active ? 'на экране' : 'в фоне'}`);
+        if (!active) release();
+        return theirs?.call(native, active);
+      };
+    } catch (e) {
+      note(`Bluefy не даёт следить за сворачиванием: ${describe(e)}`);
+    }
+  }
   navigator.bluetooth.getAvailability?.().then((on) => {
     available = on;
     note(`Bluetooth телефона: ${on ? 'включён' : 'выключен или запрещён'}`);
@@ -617,7 +642,7 @@ function start() {
   // is tried at once; a browser that insists on a tap first gets the big button instead.
   const wanted = new URLSearchParams(location.search).get('do');
   if (wanted in ACTIONS) run(wanted, true);
-  else run('refresh', false);
+  else if (!BLUEFY) run('refresh', false);
 }
 
 start();
