@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 6;
+const VERSION = 7;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -107,20 +107,33 @@ class Link {
     this.pending = new Map();
     this.reports = 0;
     this.ready = false;
+    this.closed = false;
   }
 
   async open(device) {
     this.device = device;
     this.codec.reset();
     device.addEventListener('gattserverdisconnected', () => this.dropped());
-    // A link left over from an earlier visit of this page would make connect() wait forever.
-    if (device.gatt.connected) {
-      trace('закрываю старое соединение');
+    // Whatever an earlier visit left behind (a link, or a connection still being made) keeps the
+    // lamp busy, and a browser does not always show it in gatt.connected: drop it in any case.
+    const stale = device.gatt.connected;
+    try {
       device.gatt.disconnect();
+    } catch {
+      // Nothing to drop.
+    }
+    if (stale) {
+      trace('закрываю старое соединение');
       await sleep(300);
     }
     trace('подключение к лампе');
-    const server = await within(CONNECT_MS, device.gatt.connect(), 'лампа не подключается');
+    const connecting = device.gatt.connect();
+    // A connection that arrives after the page gave up on it would hold the lamp for good, and
+    // the lamp talks to one phone at a time.
+    connecting.then(() => {
+      if (this.closed) this.close();
+    }, () => {});
+    const server = await within(CONNECT_MS, connecting, 'лампа не подключается');
     let notify, write;
     // The service that worked last time goes first: every miss costs time.
     const last = localStorage.getItem('lamp-service');
@@ -176,6 +189,7 @@ class Link {
 
   close() {
     this.ready = false;
+    this.closed = true;
     try {
       this.device?.gatt.disconnect();
     } catch {
@@ -285,6 +299,8 @@ class Link {
 const config = loadConfig();
 let link = null;
 let device = null;
+// The link being set up, so that leaving the page can stop it half-way.
+let opening = null;
 // The lamp this browser remembers did not answer: go to the device list instead of trying it again.
 let rememberedFailed = false;
 let idleTimer = null;
@@ -327,6 +343,7 @@ async function rememberedDevice() {
   if (!navigator.bluetooth.getDevices) return null;
   try {
     const known = await navigator.bluetooth.getDevices();
+    note(`известные устройства: ${known.map((d) => `${d.name ?? '?'}${d.gatt?.connected ? ' (на связи)' : ''}`).join(', ') || 'нет'}`);
     const id = localStorage.getItem('lamp-device');
     return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
   } catch (e) {
@@ -342,6 +359,10 @@ const CHOOSER_REQUESTS = [
   { filters: [{ namePrefix: 'TY' }] },
   { acceptAllDevices: true },
 ];
+
+// A lamp that is connected to anything stops announcing itself, and then no browser lists it.
+const ABSENT = 'Если её нет в списке, лампа без питания или занята: закройте совсем (смахните) Bluefy и Smart Life '
+  + 'на всех телефонах и попробуйте снова';
 
 async function chooseDevice(allowChooser) {
   if (!allowChooser) throw new NeedsTap();
@@ -361,7 +382,7 @@ async function chooseDevice(allowChooser) {
       const took = performance.now() - asked;
       note(`список закрылся через ${Math.round(took)} мс: ${describe(e)} [${kind(e)}]`);
       if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e)) || took > CHOOSER_GLANCE_MS) {
-        throw new TuyaError('лампа не выбрана. Если её нет в списке, она выключена или занята другим телефоном');
+        throw new TuyaError(`лампа не выбрана. ${ABSENT}`);
       }
       refusal = e;
     }
@@ -370,14 +391,23 @@ async function chooseDevice(allowChooser) {
     + 'и разрешён этому браузеру, затем закройте браузер совсем и откройте страницу снова');
 }
 
+const AWAY = 'страница была свёрнута';
+
 async function open(candidate) {
+  // A page in the background must not take the lamp: nobody is looking, and nothing would let go.
+  if (document.hidden) throw new TuyaError(AWAY);
   const fresh = new Link(config);
+  opening = fresh;
   try {
     await fresh.open(candidate);
   } catch (e) {
+    const left = fresh.closed;
     fresh.close();
-    throw e;
+    throw left ? new TuyaError(AWAY) : e;
+  } finally {
+    opening = null;
   }
+  if (fresh.closed) throw new TuyaError(AWAY);
   device = candidate;
   rememberedFailed = false;
   link = fresh;
@@ -407,7 +437,7 @@ async function connected(allowChooser) {
   try {
     return await open(await chooseDevice(allowChooser));
   } catch (e) {
-    if (e instanceof Stuck) throw new TuyaError('лампа не подключается: она выключена, далеко или занята другим телефоном');
+    if (e instanceof Stuck) throw new TuyaError('лампа не подключается: она без питания, далеко или занята другим телефоном');
     throw e;
   }
 }
@@ -415,10 +445,14 @@ async function connected(allowChooser) {
 /** Lets go of the lamp at once: it talks to one phone at a time. */
 function release() {
   clearTimeout(idleTimer);
+  opening?.close();
+  if (link) note('соединение закрыто');
   link?.close();
   link = null;
 }
 
+// What the browser says about the phone's Bluetooth, where it says anything.
+let available = null;
 let busy = Promise.resolve();
 
 /** Runs one button. [mayChoose] tells whether to try the browser's device chooser. */
@@ -456,7 +490,8 @@ function run(name, mayChoose) {
       } else {
         const where = step;
         note(`ошибка: ${describe(e)} [${kind(e)}]`);
-        setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth (${where}): ${describe(e)}`, true);
+        if (available === false) setStatus('Bluetooth на телефоне выключен или запрещён этому браузеру', true);
+        else setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth (${where}): ${describe(e)}`, true);
       }
     }
     render();
@@ -503,6 +538,7 @@ function start() {
   const has = (thing) => (thing ? 'есть' : 'нет');
   note(`версия ${VERSION}, Bluetooth ${has(navigator.bluetooth)}, список известных устройств ${has(navigator.bluetooth?.getDevices)}, `
     + `полный экран ${has(document.documentElement.requestFullscreen)}`);
+  note(navigator.userAgent);
   if (!navigator.bluetooth) {
     setStatus('Этот браузер не умеет Bluetooth. На iPhone откройте страницу в Bluefy, на Android — в Chrome.', true);
     return;
@@ -536,8 +572,14 @@ function start() {
   // connection, and the next visit would find it taken.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) release();
+    // Back on screen: the lamp may have been changed meanwhile.
+    else run('refresh', false);
   });
   window.addEventListener('pagehide', release);
+  navigator.bluetooth.getAvailability?.().then((on) => {
+    available = on;
+    note(`Bluetooth телефона: ${on ? 'включён' : 'выключен или запрещён'}`);
+  }, () => {});
   render();
   // A shortcut may ask for an action straight away: ...?do=dim or ...?do=bright. Then the chooser
   // is tried at once; a browser that insists on a tap first gets the big button instead.
