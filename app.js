@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 4;
+const VERSION = 5;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -476,6 +476,21 @@ function start() {
   }
   for (const button of document.querySelectorAll('[data-do]')) {
     button.addEventListener('click', () => run(button.dataset.do, true));
+  }
+  // No pinch zoom: Safari's own gesture events, and two-finger moves elsewhere.
+  for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
+    document.addEventListener(type, (e) => e.preventDefault());
+  }
+  document.addEventListener('touchmove', (e) => {
+    if (e.touches.length > 1) e.preventDefault();
+  }, { passive: false });
+  // Full screen where a phone's browser allows it (it never does without a tap, and not at all
+  // on an iPhone): the first tap asks for it.
+  if (matchMedia('(pointer: coarse)').matches) {
+    document.addEventListener('click', () => {
+      const page = document.documentElement;
+      if (!document.fullscreenElement) page.requestFullscreen?.({ navigationUI: 'hide' })?.catch(() => {});
+    }, { once: true });
   }
   // A page in the background gets no timers: without this the phone would keep the lamp's only
   // connection, and the next visit would find it taken.
