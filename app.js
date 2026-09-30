@@ -2,7 +2,7 @@
 // Android and desktop). Same logic as the Android app: read the lamp's state, then send data points.
 import { Code, Dp, TuyaCodec, TuyaError } from './tuya.js';
 
-const VERSION = 5;
+const VERSION = 6;
 
 const uuid16 = (n) => `0000${n.toString(16).padStart(4, '0')}-0000-1000-8000-00805f9b34fb`;
 const NOTIFY = uuid16(0x2b10);
@@ -17,6 +17,9 @@ const STEP_MS = 5000;
 const RESPONSE_MS = 5000;
 const REPORT_MS = 800;
 const IDLE_MS = 3000;
+// Nobody reads the browser's device list and closes it faster than this: a quicker "no" is the
+// browser refusing the request itself.
+const CHOOSER_GLANCE_MS = 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -48,6 +51,11 @@ let step = '';
 /** Notes a step of the current command; an error is reported together with the step it hit. */
 function trace(text) {
   step = text;
+  note(text);
+}
+
+/** A line for the diagnostics that is not a step of the command. */
+function note(text) {
   lines.push(`${((performance.now() - started) / 1000).toFixed(1)} с  ${text}`);
   if (lines.length > 40) lines.shift();
   const log = document.getElementById('log');
@@ -63,6 +71,12 @@ function describe(e) {
   } catch {
     return String(e);
   }
+}
+
+/** What kind of value a failure was: its text alone does not tell a number from a message. */
+function kind(e) {
+  if (e instanceof Error) return e.name;
+  return e === null ? 'null' : typeof e;
 }
 
 // --- configuration: the lamp's key, kept in this browser only ----------------------------
@@ -210,7 +224,7 @@ class Link {
     try {
       message = this.codec.feed(chunk);
     } catch (e) {
-      trace(`непонятный ответ: ${describe(e)}`);
+      note(`непонятный ответ: ${describe(e)}`);
       this.dropped();
       return;
     }
@@ -218,7 +232,7 @@ class Link {
     try {
       this.handle(message);
     } catch (e) {
-      trace(`сообщение ${message.code.toString(16)} пропущено: ${describe(e)}`);
+      note(`сообщение ${message.code.toString(16)} пропущено: ${describe(e)}`);
     }
     if (message.responseTo) {
       this.pending.get(message.responseTo)?.resolve(message);
@@ -271,6 +285,8 @@ class Link {
 const config = loadConfig();
 let link = null;
 let device = null;
+// The lamp this browser remembers did not answer: go to the device list instead of trying it again.
+let rememberedFailed = false;
 let idleTimer = null;
 let state = JSON.parse(localStorage.getItem('lamp-state') ?? 'null') ?? { on: false, bright: 0, temp: 0 };
 
@@ -314,28 +330,44 @@ async function rememberedDevice() {
     const id = localStorage.getItem('lamp-device');
     return known.find((d) => d.id === id) ?? known.find((d) => d.name === 'TY') ?? null;
   } catch (e) {
-    trace(`список известных устройств недоступен: ${describe(e)}`);
+    note(`список известных устройств недоступен: ${describe(e)}`);
     return null;
   }
 }
 
+// From the exact request to the loosest. Browsers other than Chrome refuse requests they do not
+// like without saying why (Bluefy answers with a bare number); a simpler one may pass.
+const CHOOSER_REQUESTS = [
+  { filters: [{ services: [ADVERTISED] }, { namePrefix: 'TY' }] },
+  { filters: [{ namePrefix: 'TY' }] },
+  { acceptAllDevices: true },
+];
+
 async function chooseDevice(allowChooser) {
   if (!allowChooser) throw new NeedsTap();
-  trace('выбор лампы в списке');
-  let chosen;
-  try {
-    chosen = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [ADVERTISED] }, { namePrefix: 'TY' }],
-      optionalServices: SERVICES,
-    });
-  } catch (e) {
-    // Chrome: the tap has "expired" or there was none. One more tap is needed.
-    if (e?.name === 'SecurityError') throw new NeedsTap();
-    if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e))) throw new TuyaError('лампа не выбрана');
-    throw e;
+  // The browser's list and a full-screen page get in each other's way.
+  if (document.fullscreenElement) await document.exitFullscreen?.().catch(() => {});
+  let refusal;
+  for (const [index, request] of CHOOSER_REQUESTS.entries()) {
+    trace(index ? `выбор лампы в списке, запрос попроще (${index + 1})` : 'выбор лампы в списке');
+    const asked = performance.now();
+    try {
+      const chosen = await navigator.bluetooth.requestDevice({ ...request, optionalServices: SERVICES });
+      localStorage.setItem('lamp-device', chosen.id);
+      return chosen;
+    } catch (e) {
+      // Chrome: the tap has "expired" or there was none. One more tap is needed.
+      if (e?.name === 'SecurityError') throw new NeedsTap();
+      const took = performance.now() - asked;
+      note(`список закрылся через ${Math.round(took)} мс: ${describe(e)} [${kind(e)}]`);
+      if (e?.name === 'NotFoundError' || /cancel/i.test(describe(e)) || took > CHOOSER_GLANCE_MS) {
+        throw new TuyaError('лампа не выбрана. Если её нет в списке, она выключена или занята другим телефоном');
+      }
+      refusal = e;
+    }
   }
-  localStorage.setItem('lamp-device', chosen.id);
-  return chosen;
+  throw new TuyaError(`браузер не показал список устройств (ответ: ${describe(refusal)}). Проверьте, что Bluetooth включён `
+    + 'и разрешён этому браузеру, затем закройте браузер совсем и откройте страницу снова');
 }
 
 async function open(candidate) {
@@ -347,13 +379,14 @@ async function open(candidate) {
     throw e;
   }
   device = candidate;
+  rememberedFailed = false;
   link = fresh;
   return link;
 }
 
 async function connected(allowChooser) {
   if (link?.ready) return link;
-  const candidate = device ?? (await rememberedDevice());
+  const candidate = device ?? (rememberedFailed ? null : await rememberedDevice());
   if (candidate) {
     // Twice after a tap: the first failure closes whatever was left of an old link, which often
     // is the cure. Once when the page merely looks up the state on opening.
@@ -363,11 +396,13 @@ async function connected(allowChooser) {
       } catch (e) {
         // The key is wrong or the lamp refused: another device would not help.
         if (e instanceof TuyaError) throw e;
-        trace(`знакомая лампа не подключилась (попытка ${attempt}): ${describe(e)}`);
+        note(`знакомая лампа не подключилась (попытка ${attempt}): ${describe(e)} [${kind(e)}]`);
         await sleep(400);
       }
     }
     device = null;
+    // Chrome may want one more tap before its list; that tap must not start from here again.
+    rememberedFailed = allowChooser;
   }
   try {
     return await open(await chooseDevice(allowChooser));
@@ -420,7 +455,7 @@ function run(name, mayChoose) {
         else showPrompt(name);
       } else {
         const where = step;
-        trace(`ошибка: ${describe(e)}`);
+        note(`ошибка: ${describe(e)} [${kind(e)}]`);
         setStatus(e instanceof TuyaError ? e.message : `ошибка Bluetooth (${where}): ${describe(e)}`, true);
       }
     }
@@ -465,7 +500,9 @@ function hidePrompt() {
 }
 
 function start() {
-  trace(`версия ${VERSION}, Bluetooth ${navigator.bluetooth ? 'есть' : 'нет'}, список известных устройств ${navigator.bluetooth?.getDevices ? 'есть' : 'нет'}`);
+  const has = (thing) => (thing ? 'есть' : 'нет');
+  note(`версия ${VERSION}, Bluetooth ${has(navigator.bluetooth)}, список известных устройств ${has(navigator.bluetooth?.getDevices)}, `
+    + `полный экран ${has(document.documentElement.requestFullscreen)}`);
   if (!navigator.bluetooth) {
     setStatus('Этот браузер не умеет Bluetooth. На iPhone откройте страницу в Bluefy, на Android — в Chrome.', true);
     return;
@@ -484,13 +521,16 @@ function start() {
   document.addEventListener('touchmove', (e) => {
     if (e.touches.length > 1) e.preventDefault();
   }, { passive: false });
-  // Full screen where a phone's browser allows it (it never does without a tap, and not at all
-  // on an iPhone): the first tap asks for it.
+  // Full screen where a phone's browser allows it (it never does without a tap, and Safari on an
+  // iPhone not at all). Only on a tap that will not bring up the browser's device list: a page
+  // going full screen can keep that list from appearing.
   if (matchMedia('(pointer: coarse)').matches) {
     document.addEventListener('click', () => {
       const page = document.documentElement;
-      if (!document.fullscreenElement) page.requestFullscreen?.({ navigationUI: 'hide' })?.catch(() => {});
-    }, { once: true });
+      if (document.fullscreenElement || !page.requestFullscreen || !device) return;
+      note('полный экран');
+      page.requestFullscreen({ navigationUI: 'hide' })?.catch((e) => note(`полный экран не дали: ${describe(e)}`));
+    });
   }
   // A page in the background gets no timers: without this the phone would keep the lamp's only
   // connection, and the next visit would find it taken.
