@@ -3,6 +3,7 @@ package home.lampremote
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -25,6 +26,11 @@ object Lamp {
   // The link is touched only on the worker thread.
   private var link: TuyaLink? = null
   private var syncedAt = 0L
+
+  // Taps not finished yet, and the lamp's state before the oldest of them: a failure goes back
+  // to it rather than to the guess an earlier unfinished tap had shown.
+  private var unfinished = 0
+  private var settled: LampState? = null
 
   private var idle: ScheduledFuture<*>? = null
   private val idleCallbacks = ArrayList<() -> Unit>()
@@ -128,6 +134,10 @@ object Lamp {
     val app = context.applicationContext
     val config = Config.load(app)
     val before = Store.state(app)
+    val asked = SystemClock.elapsedRealtime()
+    synchronized(this) {
+      if (unfinished++ == 0) settled = before
+    }
     // Show the expected result at once; the lamp's real state corrects it a moment later.
     if (config != null) {
       try {
@@ -142,6 +152,9 @@ object Lamp {
     worker.execute {
       val error = try {
         if (config == null) throw TuyaError("лампа не настроена: добавьте её в Smart Life и запустите tools/tuya_key.py")
+        // A tap that waited behind a lamp that would not answer is no longer what the person wants:
+        // without this, a lamp coming back would replay every tap made in the meantime.
+        if (SystemClock.elapsedRealtime() - asked > STALE_MS) throw TuyaError("лампа не ответила вовремя, нажатие отменено")
         try {
           perform(app, config, action, before)
         } catch (e: TuyaError) {
@@ -156,8 +169,14 @@ object Lamp {
         Log.i(TAG, "command failed: ${e.message}")
         // Drop the expected state: back to what the lamp last said.
         val current = link
-        if (current != null && current.ready) sync(app, current, config!!.dps, before) else Store.setState(app, before)
+        val known = synchronized(this) { settled } ?: before
+        if (current != null && current.ready) sync(app, current, config!!.dps, known) else Store.setState(app, known)
         e.message
+      }
+      synchronized(this) {
+        // What is stored now came from the lamp, or is what was known before these taps.
+        settled = Store.state(app)
+        unfinished--
       }
       Store.setStatus(app, error ?: "")
       changed(app)
@@ -228,6 +247,9 @@ object Lamp {
   }
 
   private const val IDLE_MS = 5_000L
+
+  /** A tap that could not even start within this time is dropped. */
+  private const val STALE_MS = 15_000L
 
   /** How long a state read from the lamp is trusted while the link stays open. */
   private const val FRESH_MS = 1_500L
