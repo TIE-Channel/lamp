@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <!-- A remote, not a document: no zooming. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#121210">
+  <link rel="icon" href="data:,">
+  <title>Лампа</title>
+  <style>
+    :root {
+      --bg: #121210; --card: #1d1d1a; --text: #f1f1ea; --muted: #a3a398; --border: #303029;
+      --accent: #cfc93f; --danger: #f0705f;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    /* "manipulation" leaves scrolling and taps but drops double-tap zoom; pinch is stopped in app.js. */
+    html { touch-action: manipulation; -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0; padding: calc(16px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));
+      background: var(--bg); color: var(--text);
+      font: 16px/1.35 -apple-system, system-ui, Roboto, sans-serif;
+      overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+    }
+    h1 { margin: 0; font-size: 28px; }
+    h2 { margin: 24px 0 8px; font-size: 16px; }
+    #status { margin: 2px 0 16px; min-height: 1.35em; font-size: 14px; color: var(--muted); }
+    #status.error { color: var(--danger); }
+    .row { display: grid; gap: 8px; margin-top: 8px; }
+    .modes { grid-template-columns: repeat(2, 1fr); }
+    .remote { grid-template-columns: repeat(4, 1fr); }
+    button {
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      padding: 12px 4px 10px; border: 1px solid var(--border); border-radius: 16px;
+      background: var(--card); color: var(--text); font: inherit; cursor: pointer;
+    }
+    button:active { background: #2a2a26; }
+    button span { font-size: 12px; color: var(--muted); }
+    button svg { width: 32px; height: 32px; }
+    .modes button svg { width: 56px; height: 56px; }
+    button.active { border: 2px solid var(--accent); color: var(--accent); padding: 11px 3px 9px; }
+    button.active span { color: var(--accent); }
+    svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    svg .solid { fill: currentColor; stroke: none; }
+    details { margin-top: 24px; color: var(--muted); font-size: 13px; }
+    summary { cursor: pointer; }
+    #log { margin: 8px 0 0; -webkit-user-select: text; user-select: text; white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, Menlo, monospace; }
+    #prompt {
+      position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 12px; background: var(--bg); text-align: center; padding: 24px; cursor: pointer;
+    }
+    #prompt[hidden] { display: none; }
+    #prompt strong { font-size: 28px; color: var(--accent); }
+    #prompt small { color: var(--muted); font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>Лампа</h1>
+  <div id="status"></div>
+
+  <!-- The two modes of the home-screen widget: a second tap on the active one switches the lamp off. -->
+  <div class="row modes">
+    <button id="dim" data-do="dim">
+      <svg viewBox="3 3 18 18"><path class="solid" d="M15.74,13.13A4.2,4.2 0 1 1 12.33,8.26A3.6,3.6 0 0 0 15.74,13.13Z"/><path stroke-width="2" d="M7.8,4H16.2A3.8,3.8 0 0 1 20,7.8V16.2A3.8,3.8 0 0 1 16.2,20H7.8A3.8,3.8 0 0 1 4,16.2V7.8A3.8,3.8 0 0 1 7.8,4Z"/></svg>
+      <span>Ночник</span>
+    </button>
+    <button id="bright" data-do="bright">
+      <svg viewBox="3 3 18 18"><path class="solid" d="M12,9.8A2.2,2.2 0 1 0 12,14.2A2.2,2.2 0 1 0 12,9.8Z"/><path stroke-width="1.3" d="M12,7V8.5M12,15.5V17M7,12H8.5M15.5,12H17M8.46,8.46L9.53,9.53M14.47,14.47L15.54,15.54M8.46,15.54L9.53,14.47M14.47,9.53L15.54,8.46"/><path stroke-width="2" d="M7.8,4H16.2A3.8,3.8 0 0 1 20,7.8V16.2A3.8,3.8 0 0 1 16.2,20H7.8A3.8,3.8 0 0 1 4,16.2V7.8A3.8,3.8 0 0 1 7.8,4Z"/></svg>
+      <span>Максимум</span>
+    </button>
+  </div>
+
+  <!-- The eight buttons as they sit on the lamp's own remote. -->
+  <h2>Пульт</h2>
+  <div class="row remote">
+    <button data-do="cct">
+      <svg viewBox="0 0 24 24"><path stroke-width="1.6" d="M12,8A4,4 0 1 0 12,16A4,4 0 1 0 12,8Z"/><path class="solid" d="M12,8A4,4 0 0 1 12,16Z"/><path stroke-width="1.6" d="M5,8.5A8,8 0 0 1 18.2,7M18.6,3.4V7.2H14.8M19,15.5A8,8 0 0 1 5.8,17M5.4,20.6V16.8H9.2"/></svg>
+      <span>Оттенок</span>
+    </button>
+    <button data-do="timer">
+      <svg viewBox="0 0 24 24"><path d="M12,6.5A7,7 0 1 0 12,20.5A7,7 0 1 0 12,6.5ZM9.5,2.5H14.5M12,2.5V6.5M12,13.5V9.8M17.6,7.4L19,6"/></svg>
+      <span>Таймер 60 с</span>
+    </button>
+    <button data-do="cold">
+      <svg viewBox="0 0 24 24" stroke-width="1.6"><g id="flake"><path d="M12,3V21M9.6,5L12,7.4L14.4,5M9.6,19L12,16.6L14.4,19"/></g><use href="#flake" transform="rotate(60 12 12)"/><use href="#flake" transform="rotate(120 12 12)"/></svg>
+      <span>Холодный</span>
+    </button>
+    <button data-do="warm">
+      <svg viewBox="0 0 24 24"><path class="solid" d="M12,8.4A3.6,3.6 0 1 0 12,15.6A3.6,3.6 0 1 0 12,8.4Z"/><path d="M12,3.5V6M12,18V20.5M3.5,12H6M18,12H20.5M5.99,5.99L7.76,7.76M16.24,16.24L18.01,18.01M5.99,18.01L7.76,16.24M16.24,7.76L18.01,5.99"/></svg>
+      <span>Тёплый</span>
+    </button>
+    <button data-do="power">
+      <svg viewBox="0 0 24 24"><path d="M12,3V11M7.2,6.4A7.5,7.5 0 1 0 16.8,6.4"/></svg>
+      <span>Вкл / выкл</span>
+    </button>
+    <button data-do="night">
+      <svg viewBox="0 0 24 24"><path d="M19.88,13.39A8,8 0 1 1 13.39,4.12A6.9,6.9 0 0 0 19.88,13.39Z"/></svg>
+      <span>Ночник</span>
+    </button>
+    <button data-do="up">
+      <svg viewBox="0 0 24 24"><g transform="scale(0.82)"><path d="M12,8.4A3.6,3.6 0 1 0 12,15.6A3.6,3.6 0 1 0 12,8.4ZM12,3.5V6M12,18V20.5M3.5,12H6M18,12H20.5M5.99,5.99L7.76,7.76M16.24,16.24L18.01,18.01M5.99,18.01L7.76,16.24M16.24,7.76L18.01,5.99"/></g><path d="M17,18.5H22M19.5,16V21"/></svg>
+      <span>Ярче</span>
+    </button>
+    <button data-do="down">
+      <svg viewBox="0 0 24 24"><g transform="scale(0.82)"><path d="M12,8.4A3.6,3.6 0 1 0 12,15.6A3.6,3.6 0 1 0 12,8.4ZM12,3.5V6M12,18V20.5M3.5,12H6M18,12H20.5M5.99,5.99L7.76,7.76M16.24,16.24L18.01,18.01M5.99,18.01L7.76,16.24M16.24,7.76L18.01,5.99"/></g><path d="M17,18.5H22"/></svg>
+      <span>Темнее</span>
+    </button>
+  </div>
+
+  <!-- What the page has been doing, step by step: for reporting a problem. -->
+  <details>
+    <summary>Диагностика</summary>
+    <pre id="log"></pre>
+  </details>
+
+  <!-- Shown when a shortcut asked for an action but the browser wants a tap before using Bluetooth. -->
+  <div id="prompt" hidden>
+    <small>Коснитесь экрана, чтобы выполнить</small>
+    <strong id="prompt-action"></strong>
+  </div>
+
+  <!-- The number makes browsers fetch a new script instead of a cached one; bump it with VERSION in app.js. -->
+  <script type="module" src="app.js?v=9"></script>
+</body>
+</html>
