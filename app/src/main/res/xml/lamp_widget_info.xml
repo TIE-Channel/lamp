@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+  android:minWidth="130dp"
+  android:minHeight="56dp"
+  android:minResizeWidth="110dp"
+  android:minResizeHeight="48dp"
+  android:targetCellWidth="2"
+  android:targetCellHeight="1"
+  android:resizeMode="horizontal|vertical"
+  android:updatePeriodMillis="0"
+  android:initialLayout="@layout/lamp_widget"
+  android:initialKeyguardLayout="@layout/lamp_widget"
+  android:previewLayout="@layout/lamp_widget"
+  android:description="@string/widget_description"
+  android:widgetCategory="home_screen|keyguard" />

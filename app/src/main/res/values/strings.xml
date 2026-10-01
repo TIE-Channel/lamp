@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="app_name">Лампа</string>
+  <string name="widget_label">Лампа: ночник и максимум</string>
+  <string name="widget_description">Две кнопки: ночник и максимальная яркость. Повторное нажатие на активную выключает свет.</string>
+  <string name="widget_dim">Ночник</string>
+  <string name="widget_bright">Максимальная яркость</string>
+</resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+  xmlns:tools="http://schemas.android.com/tools">
+  <application>
+    <!-- Debug builds only: lets the developer press buttons from the computer,
+         `adb shell am broadcast -n home.lampremote/.LampActionReceiver -es action press:POWER`.
+         DUMP is a permission only the adb shell holds, so other apps cannot use this. -->
+    <receiver
+      android:name=".LampActionReceiver"
+      android:exported="true"
+      android:permission="android.permission.DUMP"
+      tools:replace="android:exported" />
+  </application>
+</manifest>

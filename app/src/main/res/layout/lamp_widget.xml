@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same look as the blinds row of the DiWA widget: outlined icons with a soft shadow, no background.
+
+     The buttons are the size of app icons and sit exactly where icons would be. Measured on the
+     HyperOS launcher (5 columns, 30.09.2026): an icon cell is 240 x 240 px with a 172 px icon in
+     its middle; a widget marked "miuiWidget" gets the box around its icons, which is 34 px short
+     of the cells on the left, right and bottom; one widget dp is 2.536 px.
+     So the inner layout is stretched back over the cells (34 px = 13.4dp of negative margin) and
+     every cell holds one button; its outline fills 18/24 of the drawable, hence the 2.1dp padding:
+     (240 - 2 * 5.3) * 18 / 24 = 172 px. -->
+<!-- The id and clipToOutline tell the launcher that the widget rounds its own corners. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@android:id/background"
+  android:layout_width="match_parent"
+  android:layout_height="match_parent"
+  android:background="@drawable/lamp_widget_bg"
+  android:clipToOutline="true">
+  <LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:layout_marginStart="-13.4dp"
+    android:layout_marginEnd="-13.4dp"
+    android:layout_marginBottom="-13.4dp"
+    android:orientation="horizontal">
+    <FrameLayout
+      android:layout_width="0dp"
+      android:layout_height="match_parent"
+      android:layout_weight="1">
+      <ImageView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="2.1dp"
+        android:scaleType="fitCenter"
+        android:importantForAccessibility="no"
+        android:src="@drawable/lamp_w_dim_shadow" />
+      <ImageButton
+        android:id="@+id/lamp_dim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="2.1dp"
+        android:scaleType="fitCenter"
+        android:background="@android:color/transparent"
+        android:contentDescription="@string/widget_dim"
+        android:src="@drawable/lamp_w_dim" />
+    </FrameLayout>
+    <FrameLayout
+      android:layout_width="0dp"
+      android:layout_height="match_parent"
+      android:layout_weight="1">
+      <ImageView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="2.1dp"
+        android:scaleType="fitCenter"
+        android:importantForAccessibility="no"
+        android:src="@drawable/lamp_w_bright_shadow" />
+      <ImageButton
+        android:id="@+id/lamp_bright"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:padding="2.1dp"
+        android:scaleType="fitCenter"
+        android:background="@android:color/transparent"
+        android:contentDescription="@string/widget_bright"
+        android:src="@drawable/lamp_w_bright" />
+    </FrameLayout>
+  </LinearLayout>
+</FrameLayout>

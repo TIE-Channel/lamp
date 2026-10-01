@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+  <!-- The lamp is a Tuya Bluetooth device: the app connects to it directly. -->
+  <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+  <!-- Finding the lamp by its advertisement; never used to derive location. -->
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+  <application
+    android:allowBackup="false"
+    android:icon="@mipmap/ic_launcher"
+    android:label="@string/app_name"
+    android:theme="@style/AppTheme">
+
+    <activity
+      android:name=".MainActivity"
+      android:exported="true"
+      android:screenOrientation="portrait">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+
+    <receiver
+      android:name=".LampWidgetProvider"
+      android:exported="true"
+      android:label="@string/widget_label">
+      <intent-filter>
+        <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+      </intent-filter>
+      <meta-data
+        android:name="android.appwidget.provider"
+        android:resource="@xml/lamp_widget_info" />
+      <!-- Xiaomi's launcher then gives the widget the box around its icons instead of a
+           smaller area with a title strip below; the layout relies on that. -->
+      <meta-data
+        android:name="miuiWidget"
+        android:value="true" />
+    </receiver>
+
+    <!-- Taps on the widget buttons. -->
+    <receiver
+      android:name=".LampActionReceiver"
+      android:exported="false" />
+
+    <!-- A short foreground service: the only kind Android lets a widget tap start in the background. -->
+    <service
+      android:name=".LampService"
+      android:exported="false"
+      android:foregroundServiceType="shortService" />
+  </application>
+</manifest>

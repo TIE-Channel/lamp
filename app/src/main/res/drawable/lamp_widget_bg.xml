@@ -1,0 +1,6 @@
+<!-- Transparent; its outline is what the widget is clipped to. 17dp is just inside the corner
+     of an app icon, so the launcher's own, rounder clip never cuts the corner buttons. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+  <corners android:radius="17dp" />
+  <solid android:color="#00000000" />
+</shape>

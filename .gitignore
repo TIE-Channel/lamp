@@ -1,0 +1,10 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.apk
+.idea/
+lamp-config.json
+tools/tuya-login.png
+__pycache__/
+.kotlin/
