@@ -38,12 +38,11 @@ import java.util.concurrent.atomic.AtomicReference
  * they throw [TuyaError] with a message for the user.
  */
 @SuppressLint("MissingPermission")
-class TuyaLink(private val context: Context, private val config: LampConfig) {
-  /** Last values the lamp reported, by data point number. */
-  val dps = ConcurrentHashMap<Int, TuyaDp>()
+class TuyaLink(private val context: Context, private val config: LampConfig) : LampLink {
+  override val dps = ConcurrentHashMap<Int, TuyaDp>()
 
   @Volatile
-  var ready = false
+  override var ready = false
     private set
 
   private val codec = TuyaCodec(config.localKey, config.uuid, config.deviceId)
@@ -61,8 +60,7 @@ class TuyaLink(private val context: Context, private val config: LampConfig) {
 
   // --- public, blocking ----------------------------------------------------------------
 
-  /** Connects and logs in; a no-op when already connected. */
-  fun open() {
+  override fun open() {
     if (ready) return
     val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter ?: throw TuyaError("в телефоне нет Bluetooth")
     if (!adapter.isEnabled) throw TuyaError("Bluetooth выключен")
@@ -92,8 +90,7 @@ class TuyaLink(private val context: Context, private val config: LampConfig) {
     throw error!!
   }
 
-  /** Writes data points and waits for the lamp to accept them. */
-  fun set(values: List<TuyaDp>) {
+  override fun set(values: List<TuyaDp>) {
     Log.i(TAG, "set $values")
     val result = if (codec.protocolVersion >= 4) {
       // Protocol 4 numbers its commands and answers with the number followed by the result.
@@ -110,7 +107,7 @@ class TuyaLink(private val context: Context, private val config: LampConfig) {
    * when the numbers are listed: a request for "everything" is accepted and then ignored.
    * Returns false if no report came.
    */
-  fun refresh(ids: List<Int>): Boolean {
+  override fun refresh(ids: List<Int>): Boolean {
     val before = reports.get()
     request(TuyaCode.DEVICE_STATUS, ByteArray(ids.size) { ids[it].toByte() })
     val deadline = System.currentTimeMillis() + REPORT_MS
@@ -118,7 +115,7 @@ class TuyaLink(private val context: Context, private val config: LampConfig) {
     return reports.get() != before
   }
 
-  fun close() {
+  override fun close() {
     ready = false
     val g = gatt
     gatt = null

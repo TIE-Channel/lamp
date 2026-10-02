@@ -1,6 +1,8 @@
 package home.lampremote
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -24,7 +26,7 @@ object Lamp {
   private val main = Handler(Looper.getMainLooper())
 
   // The link is touched only on the worker thread.
-  private var link: TuyaLink? = null
+  private var link: LampLink? = null
   private var syncedAt = 0L
 
   // Taps not finished yet, and the lamp's state before the oldest of them: a failure goes back
@@ -188,8 +190,7 @@ object Lamp {
   /** [before] is the state prior to this tap; the stored one already shows the expected result. */
   private fun perform(app: Context, config: LampConfig, action: Action, before: LampState) {
     val d = config.dps
-    val link = link ?: TuyaLink(app, config).also { link = it }
-    link.open()
+    val link = connected(app, config)
     // Ask the lamp where it stands: its remote or another phone may have changed it.
     if (System.currentTimeMillis() - syncedAt > FRESH_MS) {
       // A real answer also replaces the guess about the lamp's switch-off timer.
@@ -217,7 +218,39 @@ object Lamp {
     sync(app, link, d, before)
   }
 
-  private fun stateOf(link: TuyaLink, d: DpMap, fallback: LampState) = LampState(
+  /**
+   * The open link, or a new one: over Wi-Fi, which the lamp is always on, else over Bluetooth,
+   * which it keeps only for a couple of minutes after it gets power.
+   */
+  private fun connected(app: Context, config: LampConfig): LampLink {
+    link?.let { if (it.ready) return it }
+    link?.close()
+    link = null
+    val wifi = WifiLink(app, config)
+    try {
+      wifi.open()
+      link = wifi
+      return wifi
+    } catch (e: TuyaError) {
+      wifi.close()
+      // On the home Wi-Fi a lamp that does not answer there has no power: Bluetooth would only
+      // add half a minute of waiting. Away from it, Bluetooth is the one way left.
+      if (!e.retry || onWifi(app)) throw e
+      Log.i(TAG, "no Wi-Fi link (${e.message}), trying Bluetooth")
+    }
+    val ble = TuyaLink(app, config)
+    link = ble
+    ble.open()
+    return ble
+  }
+
+  private fun onWifi(c: Context): Boolean {
+    val connectivity = c.getSystemService(ConnectivityManager::class.java) ?: return false
+    val network = connectivity.activeNetwork ?: return false
+    return connectivity.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+  }
+
+  private fun stateOf(link: LampLink, d: DpMap, fallback: LampState) = LampState(
     on = link.dps[d.switch]?.bool ?: fallback.on,
     bright = link.dps[d.bright]?.int ?: fallback.bright,
     temp = d.temp?.let { link.dps[it]?.int } ?: fallback.temp,
@@ -237,7 +270,7 @@ object Lamp {
     return LampState(on, bright, temp)
   }
 
-  private fun sync(app: Context, link: TuyaLink, d: DpMap, fallback: LampState) {
+  private fun sync(app: Context, link: LampLink, d: DpMap, fallback: LampState) {
     Store.setState(app, stateOf(link, d, fallback))
   }
 

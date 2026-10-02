@@ -2,11 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
-  <!-- The lamp is a Tuya Bluetooth device: the app connects to it directly. -->
+  <!-- Bluetooth: how the lamp was set up, and the way to it when the phone is not on the home Wi-Fi. -->
   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
   <!-- Finding the lamp by its advertisement; never used to derive location. -->
   <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <!-- The lamp is also on the home Wi-Fi, and that is the channel it keeps all the time. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
   <application
     android:allowBackup="false"

@@ -32,6 +32,8 @@ class LampConfig(
   val localKey: String,
   val mac: String?,
   val productId: String?,
+  /** The lamp's address on the home Wi-Fi, if known; the app also finds it by itself. */
+  val ip: String?,
   val dps: DpMap,
 )
 
@@ -52,6 +54,7 @@ object Config {
         localKey = json.getString("localKey"),
         mac = json.optString("mac").ifEmpty { null },
         productId = json.optString("productId").ifEmpty { null },
+        ip = json.optString("ip").ifEmpty { null },
         dps = DpMap(
           switch = d?.optInt("switch", def.switch) ?: def.switch,
           bright = d?.optInt("bright", def.bright) ?: def.bright,

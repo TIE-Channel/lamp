@@ -44,4 +44,9 @@ object Store {
   fun address(c: Context): String? = prefs(c).getString("address", null)
 
   fun setAddress(c: Context, address: String) = prefs(c).edit().putString("address", address).apply()
+
+  /** The lamp's address on the home Wi-Fi, where it last answered. */
+  fun lanAddress(c: Context): String? = prefs(c).getString("lanAddress", null)
+
+  fun setLanAddress(c: Context, address: String) = prefs(c).edit().putString("lanAddress", address).apply()
 }
