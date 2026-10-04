@@ -1,11 +1,9 @@
-# Publishes the web page (web/) to GitHub Pages whenever it changes on main:
-# https://tie-channel.github.io/lamp/ — only the three files of the page, never the lamp's key.
+# Publishes the web page (web/) to GitHub Pages when run by hand (Actions → Web page → Run
+# workflow): https://tie-channel.github.io/lamp/ — only the three files of the page, never the
+# lamp's key. Nothing runs on push.
 name: Web page
 
 on:
-  push:
-    branches: [main]
-    paths: ['web/**', 'app/src/test/resources/tuya_vectors.json', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:
